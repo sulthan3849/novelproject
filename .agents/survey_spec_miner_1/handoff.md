@@ -1,0 +1,109 @@
+# Handoff Report: Specification and Requirement Mining
+
+**Agent**: `survey_spec_miner_1` (Specification & Requirement Miner)  
+**Task**: Specification Discovery, Requirement Extraction & Feature Mining for Agentic Novel Translator  
+**Date**: 2026-09-21  
+**Handoff Type**: Hard Handoff (Task Complete)
+
+---
+
+## 1. Observation
+
+1. **Authoritative Specification (`.agents/ORIGINAL_REQUEST.md`)**:
+   - Lines 18–26: Defines three core requirements: R1 (EPUB Pipeline: `utils/epub_parser.py`, `utils/state_manager.py`), R2 (Agentic Translation Engine: `core/agentic_translator.py`), and R3 (Streamlit UI with Taste-Skill CSS: `app.py`).
+   - Lines 30–36: Defines acceptance criteria including `py_compile` syntax pass, mock processing without exceptions, EPUB parser logic identifying text nodes without stripping surrounding HTML tags, custom CSS injection (`st.markdown("<style>...</style>")`) reflecting taste-skill UI, and clean modularization into `core/`, `utils/`, and `app.py`.
+
+2. **Inline Formatting Stripping (`app.py` & `utils/epub_parser.py`)**:
+   - In `app.py:60`: `node.string = translated_text`.
+   - In empirical probe with input `<p>She looked at him with <em>fury</em> in her eyes.</p>`:
+     - Before: `Node 0: tag=p, text=She looked at him with fury in her eyes., inner_html=She looked at him with <em>fury</em> in her eyes.`
+     - After: `<p>Dia menatapnya dengan murka.</p>`
+     - The `<em>` element was completely stripped from the DOM.
+   - In `utils/epub_parser.py:37`: `has_block_child = any(child.name in target_tags for child in tag.children if child.name)`. In mixed tags `<div>Direct text in div <p>Nested paragraph</p> trailing text</div>`, the direct text of the parent `<div>` is discarded and omitted from translation.
+
+3. **Session Resumability Failure (`app.py:12-21`)**:
+   - In `app.py:12-14`:
+     ```python
+     with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp_file:
+         tmp_file.write(uploaded_file.getvalue())
+         tmp_path = tmp_file.name
+     ```
+   - In `utils/epub_parser.py:12`: `self.book_name = os.path.splitext(os.path.basename(file_path))[0]`.
+   - In `utils/state_manager.py:6`: `self.progress_file = f".{book_name}_progress.json"`.
+   - Every file upload receives a randomized tempfile name (e.g., `tmp_x912a.epub`). On re-uploading the same novel or restarting the app, a different temp file name is generated (e.g., `tmp_k382p.epub`), meaning `StateManager` looks for a non-existent state file and always restarts from chunk 0.
+
+4. **Absence of Custom CSS in UI (`app.py`)**:
+   - Verification across all 142 lines of `app.py` confirmed zero occurrences of `<style>` or `st.markdown("<style>...</style>")`. The app currently runs default Streamlit UI styling, violating AC-4.
+
+5. **Prompt Leak & Step 3 Glossary Omission (`core/prompts.py` & `core/agentic_translator.py`)**:
+   - In `core/prompts.py:21`: `get_draft_prompt()` returns literal `{text}` because double-braces `{{text}}` were evaluated by the f-string without runtime replacement.
+   - In `core/agentic_translator.py:41-42`: `draft_sys_prompt = get_draft_prompt(source_lang, target_lang, glossary)` is passed directly to `_call_llm(draft_sys_prompt, text)` without replacing `{text}`, so the LLM sees literal `{text}` in the system prompt.
+   - In `core/prompts.py:46-63`: `get_improve_prompt(source_lang, target_lang)` does not accept or include the `glossary` parameter. The Step 3 Master Rewriter operates without glossary constraints, risking terminology inconsistency across chapters.
+
+6. **State Manager Disk I/O Bottleneck (`utils/state_manager.py:37`)**:
+   - `mark_chunk_translated()` calls `self.save_state()` synchronously after every translated chunk. For a 500+ page novel containing ~10,000 paragraphs, this triggers 10,000 full-file JSON serializations and disk writes.
+
+7. **Compilation & Python Environment**:
+   - Python 3.12.10 on Windows.
+   - `python -m py_compile app.py core/agentic_translator.py core/prompts.py utils/epub_parser.py utils/state_manager.py` passed with exit code 0.
+   - Project dependencies (`streamlit 1.64.0`, `beautifulsoup4 4.15.0`, `ebooklib 0.20`, `litellm 1.102.0`, `python-dotenv 1.2.3`, `tqdm 4.68.4`) were installed successfully into the environment.
+
+---
+
+## 2. Logic Chain
+
+1. **Acceptance Criterion AC-3 requires tag preservation**: `ORIGINAL_REQUEST.md` line 32 states: "The EPUB parser logic successfully identifies text nodes without stripping surrounding HTML tags." (Observation 1).
+2. **Current implementation strips inline tags**: Observation 2 empirically demonstrates that BeautifulSoup `.string = ...` deletes child tags like `<em>`, destroying novel formatting. Therefore, `utils/epub_parser.py` and `app.py` must be refactored to extract and replace text without mutating or stripping child formatting nodes.
+3. **Resumability is broken by design**: Observation 3 shows `book_name` is computed from the randomized temporary path generated by `NamedTemporaryFile`. Because each browser session or upload generates a new random temp path, the state file path changes every run. Therefore, `StateManager` must be initialized using the stable original filename (`uploaded_file.name`) or internal EPUB metadata title.
+4. **Acceptance Criterion AC-4 is unsatisfied**: Observation 4 confirms that no custom CSS injection exists in `app.py`. Therefore, a full Taste-Skill CSS block adhering to `design-taste-frontend` / `minimalist-ui` standards (monochrome warm palette, refined typography, bento cards, no AI purple gradients) must be added.
+5. **Prompt chain has defects**: Observation 5 demonstrates that `{text}` is leaked in the draft system prompt, and glossary context is lost in Step 3. Therefore, prompt templates must be cleaned, and the glossary must be passed to both drafting and improvement stages.
+6. **500+ page novel translation will stall on disk I/O**: Observation 6 shows 10,000 synchronous disk saves. Therefore, `StateManager` must batch writes to disk (periodically and per chapter) and write atomically via a temporary file rename.
+
+---
+
+## 3. Caveats
+
+1. **Live LLM API Cost and Quotas**: During this spec mining phase, `litellm.completion` calls were probed using `unittest.mock` rather than making live paid API calls to OpenAI/Anthropic/Gemini, as no live API keys were provided in the environment.
+2. **EbookLib XML Compliance**: EbookLib generates XHTML. While `BeautifulSoup(..., 'html.parser')` is functional, standard XML parsers like `lxml-xml` are recommended to guarantee strict XML closing tags required by EPUB 3.0 readers.
+3. **Streamlit Execution Lifecycle**: Streamlit reruns scripts on interaction. For 500+ page translations taking multiple hours, process state should be isolated or managed in session state/threading to prevent browser disconnects from killing translation progress.
+
+---
+
+## 4. Conclusion
+
+The authoritative requirements from `ORIGINAL_REQUEST.md` have been fully decomposed into 34 specific features, 12 edge cases, and 8 acceptance criteria. The existing codebase provides a functional skeletal prototype, but possesses three critical compliance failures (AC-3 HTML tag stripping, AC-4 missing taste-skill CSS, and non-resumable state management via randomized temp files) alongside two prompt engineering defects.
+
+The complete specification report with comprehensive feature tables, edge case matrices, and gap analysis has been written to:
+`c:\Mek Project\novelproject\.agents\survey_spec_miner_1\report.md`
+
+The project is ready for the orchestrator to formulate the unified `PROJECT.md` and sequence Milestones 1 through 4.
+
+---
+
+## 5. Verification Method
+
+To independently verify these findings:
+
+1. **Verify Compilation (AC-1)**:
+   ```powershell
+   python -m py_compile app.py core/agentic_translator.py core/prompts.py utils/epub_parser.py utils/state_manager.py
+   ```
+   *Expected: Exit code 0, no syntax errors.*
+
+2. **Verify Destructive Tag Replacement (AC-3 violation)**:
+   ```powershell
+   python -c "from bs4 import BeautifulSoup; soup = BeautifulSoup('<p>She looked with <em>fury</em>.</p>', 'html.parser'); soup.p.string = 'Dia menatap dengan murka.'; print(str(soup.p))"
+   ```
+   *Expected output: `<p>Dia menatap dengan murka.</p>` (demonstrating `<em>` tag is stripped).*
+
+3. **Verify CSS Absence in `app.py` (AC-4 violation)**:
+   ```powershell
+   Select-String -Path app.py -Pattern "<style>"
+   ```
+   *Expected: No matches returned.*
+
+4. **Verify Draft Prompt Placeholder Leak**:
+   ```powershell
+   python -c "from core.prompts import get_draft_prompt; print(get_draft_prompt('Inggris', 'Indonesia'))"
+   ```
+   *Expected: Output contains unreplaced `{text}` in the prompt body.*
